@@ -23,7 +23,8 @@
 
 ## Быстрый старт
 
-Требуется PHP 7.4+ в CLI. Внешних зависимостей нет.
+Требуется PHP 5.3+ в CLI (сервер может работать на PHP 5.x). Внешних
+зависимостей нет.
 
 Без аргументов целью считается каталог, где лежит сам установщик:
 файл копируется в корень сайта и запускается оттуда.
@@ -47,20 +48,20 @@ php install_sec_patch.php /var/www/<site>
 Установщик вычисляет абсолютный путь сайта для `auto_prepend_file`.
 Абсолютный путь покрывает точки входа в подкаталогах (adm/ и т.п.),
 отдельные хуки не требуются. Повторный запуск обновляет блоки, а не
-дублирует их; при обновлении guard-файла создаётся резервная копия;
-при конфликте с чужим `auto_prepend_file` выводится предупреждение.
+дублирует их; guard-файл при этом перезаписывается новым содержимым; при конфликте с чужим
+`auto_prepend_file` выводится предупреждение.
 
 ## Состав патча
 
 | Файл | Роль |
 |---|---|
-| `sec_patch_cve2026.php` | Guard-скрипт, подключается ко всем запросам через `auto_prepend_file`. Ставит `memory_limit=-1`, блокирует `PHP_SESSION_UPLOAD_PROGRESS` в POST, ограничивает число и глубину входных переменных, блокирует POST без `Content-Length`, пишет в лог попытки эксплуатации и фатальные ошибки |
+| `sec_patch_cve2026.php` | Guard-скрипт, подключается ко всем запросам через `auto_prepend_file`. Ставит `memory_limit=-1`, блокирует `PHP_SESSION_UPLOAD_PROGRESS` в POST, ограничивает число и глубину входных переменных, блокирует POST без `Content-Length` и запросы с `Transfer-Encoding: chunked` (независимо от `Content-Length`), пишет в лог попытки эксплуатации и фатальные ошибки. Поддерживает диагностическую пробу: запрос с маркером (`X-Sec-Patch-Probe: chunked` или POST-поле `sec_patch_probe=chunked`) записывает в лог фактические `Transfer-Encoding`/`Content-Length` (строка `PROBE:`) без блокировки |
 | `.user.ini` | Настройки, применяемые до разбора POST: `session.upload_progress.enabled=0`, `memory_limit=-1`, `auto_prepend_file` (для PHP-FPM/CGI) |
-| `.htaccess` | Те же настройки для mod_php (Apache) в блоке `<IfModule mod_php7.c>` |
+| `.htaccess` | Те же настройки для mod_php (Apache) в блоках `<IfModule mod_php5.c>` / `mod_php7.c` / `mod_php.c`, плюс блокировка chunked-запросов на уровне Apache (`RewriteCond %{HTTP:Transfer-Encoding} chunked` → 400). Блок вставляется в начало файла, до rewrite-правил сайта (редиректов) |
 
 ## Настройка guard-скрипта
 
-Guard подключается через `auto_prepend_file`, совместим с PHP 7.4+ и не
+Guard подключается через `auto_prepend_file`, совместим с PHP 5.2+ и не
 зависит от кода сайта. Все параметры собраны в массиве
 `$GLOBALS['SEC_PATCH_CFG']` в начале `sec_patch_cve2026.php`:
 
@@ -70,26 +71,54 @@ Guard подключается через `auto_prepend_file`, совмести�
 | `max_input_count` | `1000` | Максимальное суммарное число входных переменных (GET+POST+FILES) |
 | `max_input_depth` | `5` | Максимальная глубина вложенности массивов во входных данных |
 | `block_session_upload_progress` | `true` | Блокировка ключа `PHP_SESSION_UPLOAD_PROGRESS` в POST, подтверждённый путь эксплуатации CVE-2026-109619 |
-| `block_missing_content_length` | `true` | Блокировка POST/PUT без `Content-Length` (chunked-запросы) |
-| `log_file` | `sec-patch-cve2026.log` рядом с guard'ом | Лог попыток эксплуатации и фатальных ошибок |
+| `block_missing_content_length` | `true` | Блокировка запросов с `Transfer-Encoding: chunked` (любой метод, независимо от наличия/значения `Content-Length` - по RFC 7230 при chunked CL игнорируется, chunked + CL - классический smuggling) и POST/PUT без `Content-Length` |
+| `log_file` | `sec-patch-cve2026.log` рядом с guard'ом | Лог попыток эксплуатации и фатальных ошибок; при невозможности записи - fallback в системный каталог временных файлов (`sys_get_temp_dir()`) |
 | `log_fatal_errors` | `true` | Запись фатальных ошибок в лог; помогает найти attacker-reachable fatal errors, рекомендация advisory к CVE-2026-109619 |
 
 Два замечания по сопровождению:
 
 - Установщик хранит копию guard-файла в base64 внутри себя и при повторном
-  запуске перезаписывает файл на сайте (старая версия сохраняется в
-  `sec_patch_cve2026.php.bak`). Локальные правки конфигурации при этом
-  теряются: вносите их в исходник `sec_patch_cve2026.php` и пересобирайте
-  payload установщика.
-- Если запись в лог невозможна (нет прав на каталог), guard дублирует
-  события в системный error_log.
+  запуске перезаписывает файл на сайте без создания резервных копий.
+  Локальные правки конфигурации при этом теряются: вносите их в исходник
+  `sec_patch_cve2026.php` и пересобирайте payload установщика.
+- Если запись в лог невозможна (нет прав/owner у каталога сайта), guard
+  переключается на fallback-файл в системном каталоге временных файлов
+  (`sys_get_temp_dir()`/`sec-patch-cve2026.log`) и пишет предупреждение в
+  системный error_log; если недоступен и fallback - дублирует события в
+  error_log. Установщик при установке сам проверяет запись в лог и
+  выводит понятное сообщение при проблеме с правами.
 
 ## Живые проверки (--test)
 
 URL определяется по имени папки сайта: /var/www/site.ru -> https://site.ru/.
 Проверяется три пункта:
 
-- chunked-POST без `Content-Length` возвращает `400` от guard'а;
+- chunked-POST. Проверка выполняется в два шага. Сначала проба заголовков:
+  chunked-POST с диагностическим маркером (заголовок
+  `X-Sec-Patch-Probe: chunked` и POST-поле `sec_patch_probe=chunked`).
+  Guard с поддержкой пробы записывает в `sec-patch-cve2026.log` строку
+  `PROBE: TE='...' CL='...' REQUEST_METHOD=...` и НЕ блокирует запрос.
+  По значениям TE/CL в PROBE различаются три исхода:
+
+  - `TE='chunked'` - Transfer-Encoding доходит до PHP. Тест повторяет
+    chunked-POST уже без маркера и ожидает `400` от guard'а: `[OK]` при
+    400, `[!!]` иначе (guard не блокирует - перезапустите установщик,
+    он обновит guard-файл);
+  - `TE=''` (пустой) - nginx/прокси нормализует chunked до Apache/PHP:
+    запрос доходит с `Content-Length` и без `Transfer-Encoding`, guard'у
+    нечего детектировать. Выводится `[~]`: PHP-уровень блокировки
+    неприменим, риск chunked-smuggling в PHP снят на уровне прокси -
+    это НЕ провал. Правило `.htaccess`
+    (`RewriteCond %{HTTP:Transfer-Encoding}`) по той же причине за
+    nginx тоже не сработает: Apache получает запрос уже с
+    Content-Length и без Transfer-Encoding;
+  - PROBE-строки в логе нет - `[!!]`: guard не получил пробный запрос
+    (проверьте `auto_prepend_file` на конечном домене после редиректов
+    и права на запись лога) либо установлен guard старой версии без
+    поддержки пробы - перезапустите установщик.
+
+  Проверка следует редиректам (до 3 переходов), сохраняя на каждом
+  метод POST, заголовок `Transfer-Encoding: chunked` и маркер пробы.
 - POST с `PHP_SESSION_UPLOAD_PROGRESS` фиксируется в `sec-patch-cve2026.log`;
 - ini-проба через временный файл подтверждает, что в веб-контексте
   действуют `session.upload_progress.enabled=0`, `memory_limit=-1`,
@@ -113,8 +142,17 @@ URL определяется по имени папки сайта: /var/www/sit
    работает для скриптов в корне, но ломает точки входа в подкаталогах
    (например adm/index.php): PHP ищет файл относительно каталога скрипта
    и завершается с `Failed opening required 'sec_patch_cve2026.php'`.
-3. Для mod_php добавить в `.htaccess` блок `<IfModule mod_php7.c>`,
-   также с абсолютным путём.
+3. Для mod_php добавить в `.htaccess` блоки `<IfModule mod_php5.c>` /
+   `<IfModule mod_php7.c>` / `<IfModule mod_php.c>` (по одному на каждую
+   возможную версию mod_php), также с абсолютным путём. Блок размещается
+   в начале файла, до rewrite-правил сайта, вместе с правилом блокировки
+   chunked-запросов:
+
+   ```apache
+   RewriteEngine On
+   RewriteCond %{HTTP:Transfer-Encoding} chunked [NC]
+   RewriteRule .* - [R=400,L]
+   ```
 4. Перезапустить воркеры PHP-FPM (или дождаться рестарта пула).
    Для CVE-2026-109619 это обязательный шаг advisory.
 
@@ -139,6 +177,22 @@ URL определяется по имени папки сайта: /var/www/sit
    ```
    curl -X POST -H "Transfer-Encoding: chunked" --data-binary "a=1" https://<site>/
    ```
+
+   Если сайт за nginx-фронтендом, который нормализует chunked (запрос доходит
+   до PHP с `Content-Length` и без `Transfer-Encoding`), `400` не придёт -
+   это корректное поведение, риск снят на уровне прокси. Проверить схему
+   прохождения заголовков можно пробой с маркером (guard не блокирует,
+   в лог пишется строка `PROBE: TE='...' CL='...'`):
+
+   ```
+   curl -X POST -H "Transfer-Encoding: chunked" -H "X-Sec-Patch-Probe: chunked" \
+        -d "sec_patch_probe=chunked" https://<site>/
+   grep PROBE sec-patch-cve2026.log | tail -1
+   ```
+
+   `TE='chunked'` в PROBE означает, что Transfer-Encoding доходит до PHP и
+   блокировка обязана срабатывать (повторите тест 2 без маркера - ожидается
+   400); пустой `TE=''` - нормализация на уровне прокси.
 
 3. Тест upload_progress: ожидается обычный ответ и строка
    `BLOCKED: session.upload_progress key in POST` в логе:
